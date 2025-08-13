@@ -15,6 +15,8 @@
 #include <mkl_spblas.h>
 
 #define MAX_THREAD 16
+#define LWIDTH 4
+#define LWIDTH_POW2 16
 constexpr int L1_BYTES = 32 * 1024;
 constexpr int L2_BYTES = 1024 * 1024;
 constexpr int VEC_WIDTH = 8;         // AVX2: 8 floats

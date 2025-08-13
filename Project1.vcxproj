@@ -27,6 +27,7 @@
     <ClCompile Include="custom_spmm.cpp" />
     <ClCompile Include="custom_spmm_yk.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="make_lut.cpp" />
     <ClCompile Include="MKL_Sparse_Methods.cpp" />
     <ClCompile Include="tilling.cpp" />
   </ItemGroup>

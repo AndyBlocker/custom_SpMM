@@ -41,5 +41,8 @@
     <ClCompile Include="tilling.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="make_lut.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>
