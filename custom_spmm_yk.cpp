@@ -1,6 +1,5 @@
-// optimized: acc_tile init moved outside kb loop, memcpy copy, reuse acc_tile per (cb,rb)
+ï»¿// optimized: acc_tile init moved outside kb loop, memcpy copy, reuse acc_tile per (cb,rb)
 #include "MKL_Sparse_Methods.h"
-#include "csr_builder.h"
 #include <immintrin.h>
 #include <cstring>
 #include <cstdint>
@@ -8,8 +7,8 @@
 #include <cstdio>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #include <omp.h>
-#include <thread>
 
 // portable aligned alloc/free
 static inline void* portable_aligned_alloc(size_t alignment, size_t size) {
@@ -45,204 +44,193 @@ bool MKL_Sparse_CooXDense_Fast_Gustavson_new_yk(
     int colsC,
     int /*flag*/)
 {
-    // 1) build CSR
-    std::vector<MKL_INT> row_ptr;
-    std::vector<MKL_INT> col_idx;
-    std::vector<float> val;
-
-    bool ok = build_csr_from_denseA(denseA, rowsA, colsA, row_ptr, col_idx, val, /*num_threads=*/10);
-    if (!ok) {
-        fprintf(stderr, "build_csr_from_denseA failed\n");
-        return false;
+    // auto t_start = std::chrono::steady_clock::now();
+    // 1) build CSR (same as before)
+    std::vector<int> rowCounts(rowsA, 0);
+#pragma omp parallel for num_threads(10) schedule(static, 2)
+    for (int i = 0; i < rowsA; ++i) {
+        int c = 0;
+        float* Ai = denseA + (size_t)i * colsA;
+        for (int j = 0; j < colsA; ++j) {
+            if (Ai[j] != 0.0f) ++c;
+        }
+        rowCounts[i] = c;
     }
+    std::vector<MKL_INT> row_ptr(rowsA + 1, 0);
+    for (int i = 0; i < rowsA; ++i) row_ptr[i + 1] = row_ptr[i] + rowCounts[i];
+    MKL_INT nnz = row_ptr[rowsA];
+    std::vector<MKL_INT> col_idx((size_t)nnz);
+    std::vector<float> val((size_t)nnz);
+#pragma omp parallel for num_threads(10) schedule(static, 4)
+    for (int i = 0; i < rowsA; ++i) {
+        int base = row_ptr[i], off = 0;
+        float* Ai = denseA + (size_t)i * colsA;
+        for (int j = 0; j < colsA; ++j) {
+            float x = Ai[j];
+            if (x != 0.0f) { col_idx[base + off] = (MKL_INT)j; val[base + off] = x; ++off; }
+        }
+    }
+    // auto t_end = std::chrono::steady_clock::now();
+    // std::chrono::duration<double> diff = t_end - t_start;
+    // printf("SparseÃ—Dense (mkl): %.6f s\n",
+    //    diff.count());
+    // 2) zero C
+    // std::memset(denseC, 0, sizeof(float) * (size_t)rowsA * (size_t)colsC);
 
-    int nnz = (int)row_ptr[rowsA];
-
-    // 2) zero C (keeps original behavior)
-    std::memset(denseC, 0, sizeof(float) * (size_t)rowsA * (size_t)colsC);
-
-    // 3) tiling params (unchanged)
-    Tiling t = compute_tiling(rowsA, colsA, colsC, /*prefer_threads*/ 0, /*util_ratio*/0.5, L2_BYTES, VEC_WIDTH);
-    int Kc = t.Kc;
-    int Nb = t.Nb;
-    int Rb = t.Rb;
-    int num_threads = t.num_threads;
-
-    // clamp sensible bounds (safety)
+    // 3) tiling params
+    const double util_ratio = 0.5;
+    const int target_bytes = static_cast<int>(L1_BYTES * util_ratio);
+    int Kc = 64, Nb = std::min(colsC, 64);
+    int Rb = 64;
+    if (Rb > rowsA) Rb = rowsA;
+    if (Rb < 1) {
+        Kc = std::max<int>(8, target_bytes / (4 * std::max(1, Nb)) - 1);
+        Rb = std::max<int>(1, static_cast<int>(target_bytes / (4 * std::max(1, Nb))) - Kc);
+    }
     Kc = std::max(8, std::min(Kc, colsA));
     Nb = std::max(16, std::min(Nb, colsC));
     Rb = std::max(1, std::min(Rb, rowsA));
-    if (num_threads > rowsA) num_threads = rowsA;
-
-    // persistent thread pool (static so it's reused across calls)
-    static std::unique_ptr<ThreadPool> pool;
-    static std::mutex pool_init_mtx;
-    {
-        std::lock_guard<std::mutex> lk(pool_init_mtx);
-        if (!pool) pool.reset(new ThreadPool((size_t)num_threads));
-    }
-    //printf("Kc=%d,Nb=%d,Rb=%d,num_threads=%d\n", Kc, Nb, Rb, num_threads);
-
-    // Phase 1: parallel count nonzeros per row -> rowCounts
-    std::vector<int> rowCounts((size_t)rowsA, 0);
-
-    int chunk = (rowsA + num_threads - 1) / num_threads;
-    std::vector<std::future<void>> futures;
-    futures.reserve(num_threads);
+    // printf("Kc=%d,Nb=%d,Rb=%d\n",Kc,Nb, Rb);
 
 
-    for (int cb = 0; cb < colsC; cb += Nb) {
-        int nb_eff = std::min(Nb, colsC - cb);
-        futures.push_back(pool->enqueue([=]() {
+#pragma omp parallel for num_threads(10) schedule(dynamic) collapse(2)
+    for (int rb = 0; rb < rowsA; rb += Rb) {
+        for (int cb = 0; cb < colsC; cb += Nb) {
+            const MKL_INT* row_ptr_p = row_ptr.data();
+            const MKL_INT* col_idx_p = col_idx.data();
+            const float* val_p = val.data();
+            const float* denseB_p = denseB;
+            float* denseC_p = denseC;
+
+            // FIX: nb_eff must be the remaining columns in this block
+            int nb_eff = std::min(Nb, colsC - cb);
+            if (nb_eff <= 0) continue;
+
             int vec_end = (nb_eff / VEC_WIDTH) * VEC_WIDTH;
             int acc_elems_per_row = ((nb_eff + VEC_WIDTH - 1) / VEC_WIDTH) * VEC_WIDTH;
-
-            // allocate a reusable acc_tile buffer sized for maximum rb (Rb) for this cb
             size_t max_rb_eff = (size_t)std::min(Rb, rowsA);
-            //if (acc_elems_per_row == 0) continue;
-            //if (max_rb_eff > (SIZE_MAX / acc_elems_per_row)) { fprintf(stderr, "acc_tile overflow\n"); return false; }
             size_t acc_tile_max_elems = max_rb_eff * (size_t)acc_elems_per_row;
+            if (acc_tile_max_elems == 0) continue;
+
+            // allocate acc_tile buffer for this (cb,rb) - aligned
             void* acc_tile_buf_tmp = portable_aligned_alloc(ACC_ALIGN, acc_tile_max_elems * sizeof(float));
             bool acc_tile_buf_portable = true;
             if (!acc_tile_buf_tmp) {
                 acc_tile_buf_tmp = malloc(acc_tile_max_elems * sizeof(float));
                 acc_tile_buf_portable = false;
-                //if (!acc_tile_buf_tmp) { fprintf(stderr, "acc_tile_buf alloc fail\n"); return false; }
+                if (!acc_tile_buf_tmp) {
+                    // allocation failed -> skip this tile (or handle error)
+                    continue;
+                }
             }
             float* acc_tile_buf = (float*)acc_tile_buf_tmp;
 
+            // allocate packedB buffer (kc_eff * nb_eff) later per kb loop; allocate max size now to reuse
+            size_t pack_elems_max = (size_t)Kc * (size_t)nb_eff;
+            void* packed_tmp = nullptr;
+            bool packed_portable = false;
+            if (pack_elems_max > 0) {
+                packed_tmp = portable_aligned_alloc(ACC_ALIGN, pack_elems_max * sizeof(float));
+                packed_portable = (packed_tmp != nullptr);
+                if (!packed_tmp) {
+                    packed_tmp = malloc(pack_elems_max * sizeof(float));
+                    packed_portable = false;
+                    if (!packed_tmp) {
+                        // allocation failed -> cleanup and continue
+                        if (acc_tile_buf_portable) portable_aligned_free(acc_tile_buf_tmp); else free(acc_tile_buf_tmp);
+                        continue;
+                    }
+                }
+            }
+
+            int rb_eff = std::min(Rb, rowsA - rb);
+            float* acc_tile = acc_tile_buf; // prefix usage
+
+            // init acc_tile from denseC (copy nb_eff floats), zero pad
+            for (int local_i = 0; local_i < rb_eff; ++local_i) {
+                int i = rb + local_i;
+                float* Crow = denseC_p + (size_t)i * (size_t)colsC + (size_t)cb;
+                float* dest_row = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
+                if (nb_eff > 0) memcpy(dest_row, Crow, sizeof(float) * (size_t)nb_eff);
+                for (int t = nb_eff; t < acc_elems_per_row; ++t) dest_row[t] = 0.0f;
+            }
+
+            // cursor initialised to row_ptr for each local row
+            std::vector<MKL_INT> cursor(rb_eff);
+            for (int local_i = 0; local_i < rb_eff; ++local_i) cursor[local_i] = row_ptr_p[rb + local_i];
+
+            // kb loop
             for (int kb = 0; kb < colsA; kb += Kc) {
                 int kc_eff = std::min(Kc, colsA - kb);
-                MKL_INT kblock_end = kb + kc_eff;
-                // iterate over rb blocks
+                if (kc_eff <= 0) continue;
+                if ((size_t)kc_eff > SIZE_MAX / (size_t)nb_eff) continue;
 
-                // pack denseB for this (kb,cb)
-                size_t pack_elems = (size_t)kc_eff * (size_t)nb_eff;
-                void* packed_tmp = portable_aligned_alloc(ACC_ALIGN, pack_elems * sizeof(float));
-                bool packed_portable = true;
-                if (!packed_tmp) {
-                    packed_tmp = malloc(pack_elems * sizeof(float));
-                    packed_portable = false;
-                    //if (!packed_tmp) {
-                    //    fprintf(stderr, "packedB alloc failed\n");
-                    //    if (acc_tile_buf_tmp) { if (acc_tile_buf_portable) portable_aligned_free(acc_tile_buf_tmp); else free(acc_tile_buf_tmp); }
-                    //    return false;
-                    //}
-                }
                 float* packedB = (float*)packed_tmp;
+                // pack B rows [kb .. kb+kc_eff) for columns [cb .. cb+nb_eff)
                 for (int kk = 0; kk < kc_eff; ++kk) {
-                    const float* Brow = denseB + (size_t)(kb + kk) * (size_t)colsC + (size_t)cb;
+                    const float* Brow = denseB_p + (size_t)(kb + kk) * (size_t)colsC + (size_t)cb;
                     float* dest = packedB + (size_t)kk * (size_t)nb_eff;
-                    // memcpy contiguous nb_eff floats
                     if (nb_eff > 0) memcpy(dest, Brow, sizeof(float) * (size_t)nb_eff);
                 }
 
+                // process local rows
+                for (int local_i = 0; local_i < rb_eff; ++local_i) {
+                    int i = rb + local_i;
+                    float* acc_row = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
 
-                for (int rb = 0; rb < rowsA; rb += Rb) {
-                    int rb_eff = std::min(Rb, rowsA - rb);
-                    if (rb_eff <= 0) continue;
+                    MKL_INT it0 = cursor[local_i];
+                    MKL_INT end = row_ptr_p[i + 1];
+                    while (it0 < end && col_idx_p[it0] < kb) ++it0;
+                    cursor[local_i] = it0;
+                    MKL_INT it1 = it0;
+                    MKL_INT kblock_end = kb + kc_eff;
+                    while (it1 < end && col_idx_p[it1] < kblock_end) ++it1;
+                    if (it0 >= it1) continue;
 
-                    // acc_tile for this rb is the prefix of acc_tile_buf
-                    float* acc_tile = acc_tile_buf; // size = rb_eff * acc_elems_per_row floats
-
-                    // ---- initialization: COPY denseC small block into acc_tile (only once per (cb,rb)) ----
-                    // Use memcpy per row (fast) and only write small padding to zero per row if needed.
-                    for (int local_i = 0; local_i < rb_eff; ++local_i) {
-                        int i = rb + local_i;
-                        float* Crow = denseC + (size_t)i * (size_t)colsC + (size_t)cb;
-                        float* dest_row = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
-                        // copy nb_eff floats
-                        if (nb_eff > 0) memcpy(dest_row, Crow, sizeof(float) * (size_t)nb_eff);
-                        // zero padding up to acc_elems_per_row (small <= VEC_WIDTH)
-                        for (int t = nb_eff; t < acc_elems_per_row; ++t) dest_row[t] = 0.0f;
-                    }
-
-                    std::vector<MKL_INT> cursor(rowsA);
-                    for (int i = 0; i < rowsA; ++i) cursor[i] = row_ptr[i];
-                    // ---- now for this (cb,rb) iterate over kb and accumulate directly into acc_tile ----
-
-                    // accumulate: for each row in rb, update its acc_row using packedB
-                    for (int local_i = 0; local_i < rb_eff; ++local_i) {
-                        int i = rb + local_i;
-                        float* acc_row = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
-
-                        MKL_INT start = row_ptr[i], end = row_ptr[i + 1];
-                        if (start >= end) continue;
-                        //MKL_INT it0 = cursor[i];
-                        //MKL_INT end = row_ptr[i + 1];
-                        //while (it0 < end && col_idx[it0] < kb) ++it0;
-                        //cursor[i] = it0;             // ±£´æ×´Ì¬£¬ÏÂ´Î´ÓÕâÀï¿ªÊ¼
-                        //MKL_INT it1 = it0;
-                        //while (it1 < end && col_idx[it1] < kblock_end) ++it1;
-                        //if (it0 >= it1) continue;
-
-                        MKL_INT* base = (MKL_INT*)col_idx.data();
-                        MKL_INT* s = base + start;
-                        MKL_INT* e = base + end;
-
-                        MKL_INT* p0 = std::lower_bound(s, e, kb);
-                        MKL_INT it0 = (MKL_INT)(p0 - base);
-
-                        MKL_INT* p1 = std::lower_bound(p0, e, kblock_end);
-                        MKL_INT it1 = (MKL_INT)(p1 - base);
-
-                        //// it0/it1 within current kb block
-                        //MKL_INT it0 = start;
-                        //while (it0 < end && col_idx[it0] < kb) ++it0;
-                        //MKL_INT it1 = it0;
-                        //MKL_INT kblock_end = kb + kc_eff;
-                        //while (it1 < end && col_idx[it1] < kblock_end) ++it1;
-                        //if (it0 >= it1) continue;
-
-                        MKL_INT p = it0;
-
-                        // singletons
-                        for (; p < it1; ++p) {
-                            if (p + PREFETCH_P < it1) {
-                                prefetch_read(&col_idx[p + PREFETCH_P]);
-                                prefetch_read(&val[p + PREFETCH_P]);
-                            }
-                            MKL_INT k_col = col_idx[p];
-                            float v = val[p];
-                            const float* Brow = packedB + (size_t)(k_col - kb) * (size_t)nb_eff;
-                            __m256 vv = _mm256_set1_ps(v);
-                            int j = 0;
-                            for (; j < vec_end; j += VEC_WIDTH) {
-                                __m256 accv = _mm256_load_ps(acc_row + j);
-                                __m256 bvec = _mm256_load_ps(Brow + j);
-                                accv = _mm256_fmadd_ps(vv, bvec, accv);
-                                _mm256_store_ps(acc_row + j, accv);
-                            }
-                            if (vec_end < nb_eff) {
-                                for (int jj = vec_end; jj < nb_eff; ++jj) acc_row[jj] += v * Brow[jj];
-                            }
-                        } // end singletons
-                    } // end rows in rb
-
-                    // ---- write back acc_tile once for (cb,rb) ----
-                    for (int local_i = 0; local_i < rb_eff; ++local_i) {
-                        int i = rb + local_i;
-                        float* Crow = denseC + (size_t)i * (size_t)colsC + (size_t)cb;
-                        float* src_row = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
+                    for (MKL_INT p = it0; p < it1; ++p) {
+                        MKL_INT k_col = col_idx_p[p];
+                        float v = val_p[p];
+                        const float* Brow = packedB + (size_t)(k_col - kb) * (size_t)nb_eff;
+                        __m256 vv = _mm256_set1_ps(v);
                         int j = 0;
-                        for (; j + VEC_WIDTH - 1 < nb_eff; j += VEC_WIDTH) {
-                            __m256 tmpv = _mm256_load_ps(src_row + j);    // aligned load
-                            _mm256_storeu_ps(Crow + j, tmpv);            // store to possibly unaligned C
+                        for (; j < vec_end; j += VEC_WIDTH) {
+                            __m256 accv = _mm256_load_ps(acc_row + j);
+                            __m256 bvec = _mm256_load_ps(Brow + j);
+                            accv = _mm256_fmadd_ps(vv, bvec, accv);
+                            _mm256_store_ps(acc_row + j, accv);
                         }
-                        for (; j < nb_eff; ++j) Crow[j] = src_row[j];
-                    }
-                    // free packedB for this kb
-                } // end rb loop
-                if (packed_tmp) { if (packed_portable) portable_aligned_free(packed_tmp); else free(packed_tmp); }
-            } // kb loop
+                        if (vec_end < nb_eff) {
+                            for (int jj = vec_end; jj < nb_eff; ++jj) acc_row[jj] += v * Brow[jj];
+                        }
+                    } // p
+                } // local_i
+            } // kb
 
-            // free acc_tile_buf for this cb
-            if (acc_tile_buf_tmp) { if (acc_tile_buf_portable) portable_aligned_free(acc_tile_buf_tmp); else free(acc_tile_buf_tmp); }
-        }));
-    } // cb
+            // write back acc_tile to C
+            for (int local_i = 0; local_i < rb_eff; ++local_i) {
+                int i = rb + local_i;
+                float* Crow = denseC_p + (size_t)i * (size_t)colsC + (size_t)cb;
+                float* src_row = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
+                int j = 0;
+                for (; j + VEC_WIDTH - 1 < nb_eff; j += VEC_WIDTH) {
+                    __m256 tmpv = _mm256_load_ps(src_row + j);    // aligned load (acc_tile is aligned)
+                    _mm256_storeu_ps(Crow + j, tmpv);
+                }
+                for (; j < nb_eff; ++j) Crow[j] = src_row[j];
+            }
 
-    for (auto& f : futures) {
-        f.get();
+            // cleanup: free buffers (use correct portable flags)
+            if (packed_tmp) {
+                if (packed_portable) portable_aligned_free(packed_tmp);
+                else free(packed_tmp);
+                packed_tmp = nullptr;
+            }
+            if (acc_tile_buf_tmp) {
+                if (acc_tile_buf_portable) portable_aligned_free(acc_tile_buf_tmp);
+                else free(acc_tile_buf_tmp);
+                acc_tile_buf_tmp = nullptr;
+            }
+        }
     }
 
     return true;
