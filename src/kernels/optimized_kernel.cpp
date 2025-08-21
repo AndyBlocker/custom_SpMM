@@ -8,8 +8,9 @@
 #include <memory>
 #include <immintrin.h>
 #include <cstdint>
+#include <vector>
 
-// Portable aligned alloc/free helpers
+// ------------------------ Helpers ------------------------
 static inline void* portable_aligned_alloc(size_t alignment, size_t size) {
     if (size == 0) return nullptr;
     size_t extra = alignment - 1 + sizeof(void*);
@@ -21,7 +22,6 @@ static inline void* portable_aligned_alloc(size_t alignment, size_t size) {
     *store = raw;
     return (void*)aligned;
 }
-
 static inline void portable_aligned_free(void* p) {
     if (!p) return;
     void** store = (void**)((uintptr_t)p - sizeof(void*));
@@ -29,15 +29,73 @@ static inline void portable_aligned_free(void* p) {
     free(raw);
 }
 
-// Prefetch helper
 #if defined(_MSC_VER)
 static inline void prefetch_read(const void* p) { _mm_prefetch((const char*)p, _MM_HINT_T0); }
 #else
 static inline void prefetch_read(const void* p) { __builtin_prefetch(p, 0, 1); }
 #endif
 
-// Optimized kernel based on MKL_Sparse_CooXDense_Fast_Gustavson_new_yk
-// This is the base implementation - optimizations can be added here
+// ------------------------ Micro-kernels (AVX2) ------------------------
+static inline void microkernel_j32_accumulate_row(
+    float* __restrict acc_row,
+    const float* __restrict Bp_row0,   // 注意：可设置为 (Bslab + j - kb*nb_eff)
+    int nb_eff,
+    const MKL_INT* __restrict col_idx,
+    const float*   __restrict val,
+    MKL_INT it0, MKL_INT it1,
+    int j0
+) {
+    __m256 acc0 = _mm256_load_ps(acc_row + j0 +  0);
+    __m256 acc1 = _mm256_load_ps(acc_row + j0 +  8);
+    __m256 acc2 = _mm256_load_ps(acc_row + j0 + 16);
+    __m256 acc3 = _mm256_load_ps(acc_row + j0 + 24);
+
+    for (MKL_INT p = it0; p < it1; ++p) {
+        const MKL_INT k = col_idx[p];
+        const float   v = val[p];
+        const float* __restrict Brow = Bp_row0 + (size_t)k * (size_t)nb_eff;
+        if (p + 8 < it1) {
+            prefetch_read(&col_idx[p + 8]);
+            prefetch_read(&val[p + 8]);
+        }
+        __m256 vv = _mm256_set1_ps(v);
+        __m256 b0 = _mm256_loadu_ps(Brow +  0);
+        __m256 b1 = _mm256_loadu_ps(Brow +  8);
+        __m256 b2 = _mm256_loadu_ps(Brow + 16);
+        __m256 b3 = _mm256_loadu_ps(Brow + 24);
+        acc0 = _mm256_fmadd_ps(vv, b0, acc0);
+        acc1 = _mm256_fmadd_ps(vv, b1, acc1);
+        acc2 = _mm256_fmadd_ps(vv, b2, acc2);
+        acc3 = _mm256_fmadd_ps(vv, b3, acc3);
+    }
+    _mm256_store_ps(acc_row + j0 +  0, acc0);
+    _mm256_store_ps(acc_row + j0 +  8, acc1);
+    _mm256_store_ps(acc_row + j0 + 16, acc2);
+    _mm256_store_ps(acc_row + j0 + 24, acc3);
+}
+
+static inline void microkernel_j8_accumulate_row(
+    float* __restrict acc_row,
+    const float* __restrict Bp_row0,
+    int nb_eff,
+    const MKL_INT* __restrict col_idx,
+    const float*   __restrict val,
+    MKL_INT it0, MKL_INT it1,
+    int j0
+) {
+    __m256 acc = _mm256_load_ps(acc_row + j0);
+    for (MKL_INT p = it0; p < it1; ++p) {
+        const MKL_INT k = col_idx[p];
+        const float   v = val[p];
+        const float* __restrict Brow = Bp_row0 + (size_t)k * (size_t)nb_eff + j0;
+        __m256 vv = _mm256_set1_ps(v);
+        __m256 b  = _mm256_loadu_ps(Brow);
+        acc = _mm256_fmadd_ps(vv, b, acc);
+    }
+    _mm256_store_ps(acc_row + j0, acc);
+}
+
+// ------------------------ 主函数 ------------------------
 bool MKL_Sparse_CooXDense_Fast_Gustavson_optimized(
     float* denseA,
     float* denseB,
@@ -47,27 +105,25 @@ bool MKL_Sparse_CooXDense_Fast_Gustavson_optimized(
     int colsC,
     int /*flag*/)
 {
-    // 1) build CSR
+    // 1) 构建 CSR
     std::vector<MKL_INT> row_ptr;
     std::vector<MKL_INT> col_idx;
-    std::vector<float> val;
-
-    bool ok = build_csr_from_denseA(denseA, rowsA, colsA, row_ptr, col_idx, val, /*num_threads=*/10);
-    if (!ok) {
+    std::vector<float>   val;
+    const int builder_threads = 10;
+    if (!build_csr_from_denseA(denseA, rowsA, colsA, row_ptr, col_idx, val, builder_threads)) {
         fprintf(stderr, "build_csr_from_denseA failed\n");
         return false;
     }
 
-    int nnz = (int)row_ptr[rowsA];
-
-    // 2) zero C (keeps original behavior)
+    // 2) 清零 C（保持原有行为）
     std::memset(denseC, 0, sizeof(float) * (size_t)rowsA * (size_t)colsC);
 
-    // 3) tiling params
-    const double util_ratio = 0.5;
-    const int target_bytes = static_cast<int>(L2_BYTES * util_ratio);
-    int Kc = 384, Nb = std::min(colsC, 64);
-    int Rb = std::max(1, static_cast<int>(target_bytes / (4 * std::max(1, Nb))) - Kc);
+    // 3) tile 参数
+    const double util_ratio   = 0.5;
+    const int    target_bytes = static_cast<int>(L2_BYTES * util_ratio);
+    int Kc = 384;                               // K slab
+    int Nb = std::min(colsC, 64);               // N tile
+    int Rb = std::max(1, target_bytes / (4 * std::max(1, Nb)) - Kc);
     if (Rb > rowsA) Rb = rowsA;
     if (Rb < 1) {
         Kc = std::max<int>(8, target_bytes / (4 * std::max(1, Nb)) - 1);
@@ -77,14 +133,13 @@ bool MKL_Sparse_CooXDense_Fast_Gustavson_optimized(
     Nb = std::max(16, std::min(Nb, colsC));
     Rb = std::max(1, std::min(Rb, rowsA));
 
-    // multi-thread: choose thread count
-    int num_threads = 10;
+    // 4) 线程池
+    int num_threads = builder_threads;
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 1;
     if (num_threads <= 0) num_threads = (int)hw;
     if (num_threads > rowsA) num_threads = rowsA;
 
-    // persistent thread pool (static so it's reused across calls)
     static std::unique_ptr<ThreadPool> pool;
     static std::mutex pool_init_mtx;
     {
@@ -92,222 +147,138 @@ bool MKL_Sparse_CooXDense_Fast_Gustavson_optimized(
         if (!pool) pool.reset(new ThreadPool((size_t)num_threads));
     }
 
-    // Phase 1: parallel count nonzeros per row -> rowCounts
-    std::vector<int> rowCounts((size_t)rowsA, 0);
-
-    int chunk = (rowsA + num_threads - 1) / num_threads;
+    // 5) 以 cb 为任务单元：对每个 cb，只为“活跃”的 K slab 打包并复用到所有 rb
     std::vector<std::future<void>> futures;
-    futures.reserve(num_threads);
+    futures.reserve((colsC + Nb - 1) / Nb);
 
     for (int cb = 0; cb < colsC; cb += Nb) {
-        int nb_eff = std::min(Nb, colsC - cb);
-        futures.push_back(pool->enqueue([=, &row_ptr, &col_idx, &val, &denseC]() {
-            int vec_end = (nb_eff / VEC_WIDTH) * VEC_WIDTH;
-            int acc_elems_per_row = ((nb_eff + VEC_WIDTH - 1) / VEC_WIDTH) * VEC_WIDTH;
+        const int nb_eff = std::min(Nb, colsC - cb);
+        futures.push_back(pool->enqueue([=, &row_ptr, &col_idx, &val, &denseB, &denseC]() {
+            const int VEC_WIDTH = 8;  // AVX2
+            const int vec_end   = (nb_eff / VEC_WIDTH) * VEC_WIDTH;
+            const int acc_elems_per_row = ((nb_eff + VEC_WIDTH - 1) / VEC_WIDTH) * VEC_WIDTH;
+            const int JT = 4 * VEC_WIDTH; // 32 floats
 
-            // allocate a reusable acc_tile buffer sized for maximum rb (Rb) for this cb
-            size_t max_rb_eff = (size_t)std::min(Rb, rowsA);
-            size_t acc_tile_max_elems = max_rb_eff * (size_t)acc_elems_per_row;
-            void* acc_tile_buf_tmp = portable_aligned_alloc(ACC_ALIGN, acc_tile_max_elems * sizeof(float));
-            bool acc_tile_buf_portable = true;
-            if (!acc_tile_buf_tmp) {
-                acc_tile_buf_tmp = malloc(acc_tile_max_elems * sizeof(float));
-                acc_tile_buf_portable = false;
-            }
-            float* acc_tile_buf = (float*)acc_tile_buf_tmp;
+            // ---- 线程本地 acc_tile（最大 Rb×acc_elems_per_row）----
+            const size_t acc_tile_max_elems = (size_t)std::min(Rb, rowsA) * (size_t)acc_elems_per_row;
+            void* acc_tile_tmp = portable_aligned_alloc(ACC_ALIGN, acc_tile_max_elems * sizeof(float));
+            bool acc_tile_portable = true;
+            if (!acc_tile_tmp) { acc_tile_tmp = malloc(acc_tile_max_elems * sizeof(float)); acc_tile_portable = false; if (!acc_tile_tmp) return; }
+            float* __restrict acc_tile_buf = (float*)acc_tile_tmp;
 
-            // iterate over rb blocks
-            for (int rb = 0; rb < rowsA; rb += Rb) {
-                int rb_eff = std::min(Rb, rowsA - rb);
-                if (rb_eff <= 0) continue;
+            // ---- B slab 缓冲：仅 Kc×nb_eff，按需打包 ----
+            const size_t bslab_elems = (size_t)Kc * (size_t)nb_eff;
+            void* bslab_tmp = portable_aligned_alloc(ACC_ALIGN, bslab_elems * sizeof(float));
+            bool bslab_portable = true;
+            if (!bslab_tmp) { bslab_tmp = malloc(bslab_elems * sizeof(float)); bslab_portable = false; if (!bslab_tmp) { if (acc_tile_tmp) { if (acc_tile_portable) portable_aligned_free(acc_tile_tmp); else free(acc_tile_tmp);} return; } }
+            float* __restrict Bslab = (float*)bslab_tmp;
 
-                // acc_tile for this rb is the prefix of acc_tile_buf
-                float* acc_tile = acc_tile_buf; // size = rb_eff * acc_elems_per_row floats
+            // ---- per-row 游标（跨 kb 递进）和行末 ----
+            std::vector<MKL_INT> pos((size_t)rowsA), rend((size_t)rowsA);
+            for (int i = 0; i < rowsA; ++i) { pos[i] = row_ptr[i]; rend[i] = row_ptr[i + 1]; }
 
-                // initialization: COPY denseC small block into acc_tile (only once per (cb,rb))
-                for (int local_i = 0; local_i < rb_eff; ++local_i) {
-                    int i = rb + local_i;
-                    float* Crow = denseC + (size_t)i * (size_t)colsC + (size_t)cb;
-                    float* dest_row = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
-                    // copy nb_eff floats
-                    if (nb_eff > 0) memcpy(dest_row, Crow, sizeof(float) * (size_t)nb_eff);
-                    // zero padding up to acc_elems_per_row (small <= VEC_WIDTH)
-                    for (int t = nb_eff; t < acc_elems_per_row; ++t) dest_row[t] = 0.0f;
+            // ---- 预留 it0/it1（每个 kb 计算一次，rb 重用）----
+            std::vector<MKL_INT> it0((size_t)rowsA), it1((size_t)rowsA);
+
+            // ---- 外层: K slab（只对活跃 slab 打包）----
+            for (int kb = 0; kb < colsA; kb += Kc) {
+                const int kc_eff = std::min(Kc, colsA - kb);
+                const int kblock_end = kb + kc_eff;
+
+                // 先扫描所有行，求出 it0/it1，并统计是否“活跃”
+                bool active = false;
+                for (int i = 0; i < rowsA; ++i) {
+                    MKL_INT p = pos[i];
+                    const MKL_INT end = rend[i];
+                    while (p < end && col_idx[p] < kb) ++p;          // 跳到 >= kb
+                    MKL_INT q = p;
+                    while (q < end && col_idx[q] < kblock_end) ++q;  // 到 < kb+kc
+                    it0[i] = p; it1[i] = q;
+                    if (p < q) active = true;
+                }
+                if (!active) {
+                    // 本 slab 完全没有非零，推进 pos 后跳过
+                    for (int i = 0; i < rowsA; ++i) pos[i] = it1[i];
+                    continue;
                 }
 
-                // now for this (cb,rb) iterate over kb and accumulate directly into acc_tile
-                for (int kb = 0; kb < colsA; kb += Kc) {
-                    int kc_eff = std::min(Kc, colsA - kb);
+                // 打包本 slab：kc_eff×nb_eff（只打一次）
+                for (int kk = 0; kk < kc_eff; ++kk) {
+                    const float* __restrict Brow = denseB + (size_t)(kb + kk) * (size_t)colsC + (size_t)cb;
+                    float*       __restrict Bdst = Bslab  + (size_t)kk * (size_t)nb_eff;
+                    if (nb_eff > 0) std::memcpy(Bdst, Brow, sizeof(float) * (size_t)nb_eff);
+                }
 
-                    // pack denseB for this (kb,cb)
-                    size_t pack_elems = (size_t)kc_eff * (size_t)nb_eff;
-                    void* packed_tmp = portable_aligned_alloc(ACC_ALIGN, pack_elems * sizeof(float));
-                    bool packed_portable = true;
-                    if (!packed_tmp) {
-                        packed_tmp = malloc(pack_elems * sizeof(float));
-                        packed_portable = false;
-                    }
-                    float* packedB = (float*)packed_tmp;
-                    for (int kk = 0; kk < kc_eff; ++kk) {
-                        const float* Brow = denseB + (size_t)(kb + kk) * (size_t)colsC + (size_t)cb;
-                        float* dest = packedB + (size_t)kk * (size_t)nb_eff;
-                        if (nb_eff > 0) memcpy(dest, Brow, sizeof(float) * (size_t)nb_eff);
-                    }
+                // 计算：对所有 rb，使用同一个 Bslab
+                for (int rb = 0; rb < rowsA; rb += Rb) {
+                    const int rb_eff = std::min(Rb, rowsA - rb);
+                    if (rb_eff <= 0) continue;
 
-                    // accumulate: for each row in rb, update its acc_row using packedB
+                    float* __restrict acc_tile = acc_tile_buf;
+
+                    // acc_tile 清零（我们已在函数开头把 C 清零，这里不再从 C memcpy）
+                    // 置零 padded 整行，利于对齐向量化
                     for (int local_i = 0; local_i < rb_eff; ++local_i) {
-                        int i = rb + local_i;
-                        float* acc_row = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
-
-                        MKL_INT start = row_ptr[i], end = row_ptr[i + 1];
-                        if (start >= end) continue;
-
-                        // it0/it1 within current kb block
-                        MKL_INT it0 = start;
-                        while (it0 < end && col_idx[it0] < kb) ++it0;
-                        MKL_INT it1 = it0;
-                        MKL_INT kblock_end = kb + kc_eff;
-                        while (it1 < end && col_idx[it1] < kblock_end) ++it1;
-                        if (it0 >= it1) continue;
-
-                        MKL_INT p = it0;
-                        // 4-wide unroll
-                        for (; p + 3 < it1; p += 4) {
-                            MKL_INT k0 = col_idx[p + 0]; float v0 = val[p + 0];
-                            MKL_INT k1 = col_idx[p + 1]; float v1 = val[p + 1];
-                            MKL_INT k2 = col_idx[p + 2]; float v2 = val[p + 2];
-                            MKL_INT k3 = col_idx[p + 3]; float v3 = val[p + 3];
-
-                            const float* B0 = packedB + (size_t)(k0 - kb) * (size_t)nb_eff;
-                            const float* B1 = packedB + (size_t)(k1 - kb) * (size_t)nb_eff;
-                            const float* B2 = packedB + (size_t)(k2 - kb) * (size_t)nb_eff;
-                            const float* B3 = packedB + (size_t)(k3 - kb) * (size_t)nb_eff;
-
-                            __m256 v0v = _mm256_set1_ps(v0);
-                            __m256 v1v = _mm256_set1_ps(v1);
-                            __m256 v2v = _mm256_set1_ps(v2);
-                            __m256 v3v = _mm256_set1_ps(v3);
-
-                            int j = 0;
-                            for (; j + VEC_WIDTH3 < vec_end; j += VEC_WIDTH4) {
-                                __m256 acc0 = _mm256_load_ps(acc_row + j);
-                                __m256 acc1 = _mm256_load_ps(acc_row + j + VEC_WIDTH);
-                                __m256 acc2 = _mm256_load_ps(acc_row + j + VEC_WIDTH * 2);
-                                __m256 acc3 = _mm256_load_ps(acc_row + j + VEC_WIDTH * 3);
-
-                                __m256 b0_0 = _mm256_load_ps(B0 + j);
-                                __m256 b1_0 = _mm256_load_ps(B1 + j);
-                                __m256 b2_0 = _mm256_load_ps(B2 + j);
-                                __m256 b3_0 = _mm256_load_ps(B3 + j);
-
-                                __m256 b0_1 = _mm256_load_ps(B0 + j + VEC_WIDTH);
-                                __m256 b1_1 = _mm256_load_ps(B1 + j + VEC_WIDTH);
-                                __m256 b2_1 = _mm256_load_ps(B2 + j + VEC_WIDTH);
-                                __m256 b3_1 = _mm256_load_ps(B3 + j + VEC_WIDTH);
-
-                                __m256 b0_2 = _mm256_load_ps(B0 + j + VEC_WIDTH * 2);
-                                __m256 b1_2 = _mm256_load_ps(B1 + j + VEC_WIDTH * 2);
-                                __m256 b2_2 = _mm256_load_ps(B2 + j + VEC_WIDTH * 2);
-                                __m256 b3_2 = _mm256_load_ps(B3 + j + VEC_WIDTH * 2);
-
-                                __m256 b0_3 = _mm256_load_ps(B0 + j + VEC_WIDTH * 3);
-                                __m256 b1_3 = _mm256_load_ps(B1 + j + VEC_WIDTH * 3);
-                                __m256 b2_3 = _mm256_load_ps(B2 + j + VEC_WIDTH * 3);
-                                __m256 b3_3 = _mm256_load_ps(B3 + j + VEC_WIDTH * 3);
-
-                                acc0 = _mm256_fmadd_ps(v0v, b0_0, acc0);
-                                acc1 = _mm256_fmadd_ps(v0v, b0_1, acc1);
-                                acc2 = _mm256_fmadd_ps(v0v, b0_2, acc2);
-                                acc3 = _mm256_fmadd_ps(v0v, b0_3, acc3);
-
-                                acc0 = _mm256_fmadd_ps(v1v, b1_0, acc0);
-                                acc1 = _mm256_fmadd_ps(v1v, b1_1, acc1);
-                                acc2 = _mm256_fmadd_ps(v1v, b1_2, acc2);
-                                acc3 = _mm256_fmadd_ps(v1v, b1_3, acc3);
-
-                                acc0 = _mm256_fmadd_ps(v2v, b2_0, acc0);
-                                acc1 = _mm256_fmadd_ps(v2v, b2_1, acc1);
-                                acc2 = _mm256_fmadd_ps(v2v, b2_2, acc2);
-                                acc3 = _mm256_fmadd_ps(v2v, b2_3, acc3);
-
-                                acc0 = _mm256_fmadd_ps(v3v, b3_0, acc0);
-                                acc1 = _mm256_fmadd_ps(v3v, b3_1, acc1);
-                                acc2 = _mm256_fmadd_ps(v3v, b3_2, acc2);
-                                acc3 = _mm256_fmadd_ps(v3v, b3_3, acc3);
-
-                                _mm256_store_ps(acc_row + j, acc0);
-                                _mm256_store_ps(acc_row + j + VEC_WIDTH, acc1);
-                                _mm256_store_ps(acc_row + j + VEC_WIDTH * 2, acc2);
-                                _mm256_store_ps(acc_row + j + VEC_WIDTH * 3, acc3);
-
-                                prefetch_read(B0 + j + 16);
-                                prefetch_read(B1 + j + 16);
-                                prefetch_read(B2 + j + 16);
-                                prefetch_read(B3 + j + 16);
-                            }
-                            for (; j < vec_end; j += VEC_WIDTH) {
-                                __m256 accv = _mm256_load_ps(acc_row + j);
-                                __m256 b0 = _mm256_load_ps(B0 + j);
-                                __m256 b1 = _mm256_load_ps(B1 + j);
-                                __m256 b2 = _mm256_load_ps(B2 + j);
-                                __m256 b3 = _mm256_load_ps(B3 + j);
-                                accv = _mm256_fmadd_ps(v0v, b0, accv);
-                                accv = _mm256_fmadd_ps(v1v, b1, accv);
-                                accv = _mm256_fmadd_ps(v2v, b2, accv);
-                                accv = _mm256_fmadd_ps(v3v, b3, accv);
-                                _mm256_store_ps(acc_row + j, accv);
-                            }
-                        } // end p by 4
-
-                        // singletons
-                        for (; p < it1; ++p) {
-                            if (p + PREFETCH_P < it1) {
-                                prefetch_read(&col_idx[p + PREFETCH_P]);
-                                prefetch_read(&val[p + PREFETCH_P]);
-                            }
-                            MKL_INT k_col = col_idx[p];
-                            float v = val[p];
-                            const float* Brow = packedB + (size_t)(k_col - kb) * (size_t)nb_eff;
-                            __m256 vv = _mm256_set1_ps(v);
-                            int j = 0;
-                            for (; j < vec_end; j += VEC_WIDTH) {
-                                __m256 accv = _mm256_load_ps(acc_row + j);
-                                __m256 bvec = _mm256_load_ps(Brow + j);
-                                accv = _mm256_fmadd_ps(vv, bvec, accv);
-                                _mm256_store_ps(acc_row + j, accv);
-                            }
-                            if (vec_end < nb_eff) {
-                                for (int jj = vec_end; jj < nb_eff; ++jj) acc_row[jj] += v * Brow[jj];
-                            }
-                        } // end singletons
-                    } // end rows in rb
-
-                    // free packedB for this kb
-                    if (packed_tmp) { if (packed_portable) portable_aligned_free(packed_tmp); else free(packed_tmp); }
-                } // end kb loop
-
-                // write back acc_tile once for (cb,rb)
-                for (int local_i = 0; local_i < rb_eff; ++local_i) {
-                    int i = rb + local_i;
-                    float* Crow = denseC + (size_t)i * (size_t)colsC + (size_t)cb;
-                    float* src_row = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
-                    int j = 0;
-                    for (; j + VEC_WIDTH - 1 < nb_eff; j += VEC_WIDTH) {
-                        __m256 tmpv = _mm256_load_ps(src_row + j);    // aligned load
-                        _mm256_storeu_ps(Crow + j, tmpv);            // store to possibly unaligned C
+                        float* __restrict dest_row = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
+                        std::memset(dest_row, 0, sizeof(float) * (size_t)acc_elems_per_row);
                     }
-                    for (; j < nb_eff; ++j) Crow[j] = src_row[j];
-                }
-            } // rb loop
 
-            // free acc_tile_buf for this cb
-            if (acc_tile_buf_tmp) { if (acc_tile_buf_portable) portable_aligned_free(acc_tile_buf_tmp); else free(acc_tile_buf_tmp); }
+                    // 以行为单位做累加（寄存器微核），范围为 it0/it1
+                    const float* __restrict Bp_offset_base = Bslab - (size_t)kb * (size_t)nb_eff; // 让 Brow = (Bp_offset_base + k*nb + j)
+                    for (int local_i = 0; local_i < rb_eff; ++local_i) {
+                        const int i = rb + local_i;
+                        const MKL_INT p0 = it0[i], p1 = it1[i];
+                        if (p0 >= p1) continue;
+
+                        float* __restrict acc_row = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
+
+                        int j = 0;
+                        const int j32_end = (vec_end / JT) * JT;
+                        for (; j < j32_end; j += JT) {
+                            const float* __restrict Bp_row0 = Bp_offset_base + (size_t)j;
+                            microkernel_j32_accumulate_row(acc_row, Bp_row0, nb_eff, col_idx.data(), val.data(), p0, p1, j);
+                        }
+                        for (; j + VEC_WIDTH - 1 < vec_end; j += VEC_WIDTH) {
+                            const float* __restrict Bp_row0 = Bp_offset_base + (size_t)j;
+                            microkernel_j8_accumulate_row(acc_row, Bp_row0, nb_eff, col_idx.data(), val.data(), p0, p1, j);
+                        }
+                        for (; j < nb_eff; ++j) {
+                            float acc = acc_row[j];
+                            for (MKL_INT q = p0; q < p1; ++q) {
+                                const MKL_INT k = col_idx[q];
+                                const float   v = val[q];
+                                acc += v * Bslab[(size_t)(k - kb) * (size_t)nb_eff + (size_t)j];
+                            }
+                            acc_row[j] = acc;
+                        }
+                    } // rows in rb
+
+                    // 写回：把本 slab 贡献加到 C（C 初始为 0，等价于最终累加）
+                    for (int local_i = 0; local_i < rb_eff; ++local_i) {
+                        const int i = rb + local_i;
+                        float* __restrict Crow   = denseC + (size_t)i * (size_t)colsC + (size_t)cb;
+                        float* __restrict srcrow = acc_tile + (size_t)local_i * (size_t)acc_elems_per_row;
+
+                        int j = 0;
+                        for (; j + 7 < nb_eff; j += 8) {
+                            __m256 c  = _mm256_loadu_ps(Crow + j);
+                            __m256 v  = _mm256_load_ps(srcrow + j);
+                            c = _mm256_add_ps(c, v);
+                            _mm256_storeu_ps(Crow + j, c);
+                        }
+                        for (; j < nb_eff; ++j) Crow[j] += srcrow[j];
+                    }
+                } // rb
+
+                // 推进 per-row 游标
+                for (int i = 0; i < rowsA; ++i) pos[i] = it1[i];
+            } // kb
+
+            if (bslab_tmp)   { if (bslab_portable)   portable_aligned_free(bslab_tmp);   else free(bslab_tmp); }
+            if (acc_tile_tmp){ if (acc_tile_portable)portable_aligned_free(acc_tile_tmp); else free(acc_tile_tmp); }
         }));
-    } // cb
-
-    for (auto& f : futures) {
-        f.get();
     }
 
+    for (auto& f : futures) f.get();
     return true;
 }

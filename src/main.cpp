@@ -1,11 +1,4 @@
-﻿/*  Demo：验证优化后的 Sparse × Dense
- *  说明：
- *    • 默认矩阵规模 2048 × 2048，sparsity=0.90 表示 90 % 元素为 0
- *    • 可通过命令行参数修改稀疏度：  ./demo 0.85
- *    • 代码同时给出等尺寸 Dense×Dense 基准
- */
-
-#include "../include/MKL_Sparse_Methods.h"
+﻿#include "../include/MKL_Sparse_Methods.h"
 #include <ctime>
 #include <cstdlib>
 #include <cstdio>
@@ -385,18 +378,18 @@ static double SparseDenseGustavsonDemoNew(int M, int N, int K,
     auto t_end = std::chrono::steady_clock::now();
     std::chrono::duration<double> diff = t_end - t_start;
 
-    //if (success) {
-    //    if (M * K <= 1000000) { // 验证
-    //        printf("Starting verification...\n");
-    //        verify_result_1d(A, B, C, M, N, K);
-    //    }
-    //    else {
-    //        printf("Matrix too large for verification (%d elements), skipping...\n", M * K);
-    //    }
-    //}
-    //else {
-    //    printf("Gustavson SpMM failed!\n");
-    //}
+    if (success) {
+        if (M * K <= 1000000) { // 验证
+            printf("Starting verification...\n");
+            verify_result_1d(A, B, C, M, N, K);
+        }
+        else {
+            printf("Matrix too large for verification (%d elements), skipping...\n", M * K);
+        }
+    }
+    else {
+        printf("Gustavson SpMM failed!\n");
+    }
 
     if (A) { std::free(A); A = nullptr; }
     if (B) { std::free(B); B = nullptr; }

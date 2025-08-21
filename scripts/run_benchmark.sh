@@ -98,6 +98,18 @@ while [[ $# -gt 0 ]]; do
             EXTRA_ARGS="$EXTRA_ARGS --quiet"
             shift
             ;;
+        --verify)
+            EXTRA_ARGS="$EXTRA_ARGS --verify"
+            shift
+            ;;
+        --verify-tolerance)
+            EXTRA_ARGS="$EXTRA_ARGS --verify-tolerance $2"
+            shift 2
+            ;;
+        --max-verify-elements)
+            EXTRA_ARGS="$EXTRA_ARGS --max-verify-elements $2"
+            shift 2
+            ;;
         --build)
             echo "Building benchmark first..."
             "$SCRIPT_DIR/build.sh" --target unified
@@ -114,6 +126,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --test <n>            Number of test iterations"
             echo "  --threads <n>         Number of threads to use"
             echo "  --quiet, -q           Suppress verbose output"
+            echo "  --verify              Enable result verification against MKL dense baseline"
+            echo "  --verify-tolerance <f> Set verification tolerance (default: 1e-5)"
+            echo "  --max-verify-elements <n> Skip verification for matrices larger than this"
             echo "  --build               Build the benchmark before running"
             echo "  --help, -h            Show this help message"
             echo ""
@@ -174,11 +189,10 @@ else
     fi
 fi
 
-# Check if benchmark binary exists
-if [ ! -f "$BENCHMARK_BINARY" ]; then
-    echo "Benchmark binary not found. Building..."
-    "$SCRIPT_DIR/build.sh" --target unified
-fi
+# Always perform clean build
+echo "Performing clean build..."
+cd "$PROJECT_ROOT"
+make clean && make
 
 # Setup environment
 setup_mkl_env
