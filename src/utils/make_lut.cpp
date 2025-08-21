@@ -1,4 +1,4 @@
-#include "MKL_Sparse_Methods.h"
+#include "../include/MKL_Sparse_Methods.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

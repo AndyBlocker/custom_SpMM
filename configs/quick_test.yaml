@@ -1,0 +1,19 @@
+# Quick test configuration
+# For debugging and quick validation
+
+matrix_sizes:
+  - 256x256x256
+  - 512x512x512
+
+sparsities: [0.9]
+
+kernels:
+  - all
+
+# Minimal iterations for quick testing
+warmup_iterations: 2
+test_iterations: 5
+num_threads: 0
+
+output_file: "results/quick_test.csv"
+verbose: true

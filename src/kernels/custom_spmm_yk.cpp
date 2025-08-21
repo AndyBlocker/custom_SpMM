@@ -1,5 +1,5 @@
 ﻿// optimized: acc_tile init moved outside kb loop, memcpy copy, reuse acc_tile per (cb,rb)
-#include "MKL_Sparse_Methods.h"
+#include "../include/MKL_Sparse_Methods.h"
 #include <immintrin.h>
 #include <cstring>
 #include <cstdint>
@@ -35,7 +35,9 @@ static inline void prefetch_read(const void* p) { _mm_prefetch((const char*)p, _
 static inline void prefetch_read(const void* p) { __builtin_prefetch(p, 0, 1); }
 #endif
 
-bool MKL_Sparse_CooXDense_Fast_Gustavson_new_yk(
+// Moved to MKL_Sparse_Methods.cpp as the primary implementation
+#if 0
+bool MKL_Sparse_CooXDense_Fast_Gustavson_new_yk_old(
     float* denseA,
     float* denseB,
     float* denseC,
@@ -235,3 +237,4 @@ bool MKL_Sparse_CooXDense_Fast_Gustavson_new_yk(
 
     return true;
 }
+#endif

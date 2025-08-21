@@ -1,0 +1,22 @@
+# Simple benchmark configuration
+# Your 4 specific test cases
+
+matrix_sizes:
+  - 197x3072x768
+  - 197x768x768
+  - 197x768x3072
+  - 197x768x2304
+
+sparsities: [0.8, 0.9, 0.95, 0.99]
+
+kernels:
+  - all  # Run all kernels
+
+# Execution parameters
+warmup_iterations: 50
+test_iterations: 100
+num_threads: 0  # 0 = auto-detect
+
+# Output settings
+output_file: "benchmark_simple.csv"
+verbose: true

@@ -70,6 +70,15 @@ bool MKL_Sparse_CooXDense_Fast_Gustavson_new_yk(
     int             colsC,
     int             flag);
 
+bool MKL_Sparse_CooXDense_Fast_Gustavson_optimized(
+    float* denseA,
+    float* denseB,
+    float* denseC,
+    int             rowsA,
+    int             colsA,
+    int             colsC,
+    int             flag);
+
 struct Tiling {
     int Kc;
     int Nb;

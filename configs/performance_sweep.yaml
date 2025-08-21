@@ -1,0 +1,38 @@
+# Performance sweep configuration
+# Tests various matrix sizes and sparsity levels
+
+# Test different matrix shapes
+matrix_sizes:
+  # Square matrices
+  - 512x512x512
+  - 1024x1024x1024
+  - 2048x2048x2048
+  
+  # Your specific cases
+  - 197x3072x768
+  - 197x768x768
+  - 197x768x3072
+  - 197x768x2304
+  
+  # Tall-skinny (M > N, K)
+  - 4096x512x512
+  - 8192x256x256
+  
+  # Short-wide (M < N, K)  
+  - 512x4096x4096
+  - 256x8192x8192
+
+# Test range of sparsity levels
+sparsities: [0.5, 0.7, 0.8, 0.85, 0.9, 0.95, 0.99]
+
+# Compare all implementations
+kernels:
+  - all
+
+# Reasonable iterations for performance testing
+warmup_iterations: 10
+test_iterations: 30
+num_threads: 0  # auto-detect
+
+output_file: "results/performance_sweep.csv"
+verbose: true

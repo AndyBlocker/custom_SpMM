@@ -5,7 +5,7 @@
  *    • 代码同时给出等尺寸 Dense×Dense 基准
  */
 
-#include "MKL_Sparse_Methods.h"
+#include "../include/MKL_Sparse_Methods.h"
 #include <ctime>
 #include <cstdlib>
 #include <cstdio>

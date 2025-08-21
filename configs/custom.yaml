@@ -1,0 +1,30 @@
+# Custom benchmark configuration example
+# This shows all available options
+
+# Matrix sizes - you can specify multiple sizes
+matrix_sizes:
+  - 512x512x512
+  - 1024x1024x1024
+  - 197x3072x768
+  - 4096x512x512    # tall-skinny
+  - 512x4096x4096   # short-wide
+
+# Sparsity levels to test
+sparsities: [0.8, 0.9, 0.95]
+
+# Which kernels to benchmark
+# Options: mkl_sparse, gustavson, gustavson_new, optimized, mkl_dense, all
+kernels:
+  - gustavson_new
+  - optimized
+  - mkl_sparse
+  - mkl_dense
+
+# Execution parameters
+warmup_iterations: 20
+test_iterations: 50
+num_threads: 8  # Set specific thread count
+
+# Output settings
+output_file: "custom_benchmark.csv"  # Will be saved in timestamped subdirectory
+verbose: false  # Run quietly

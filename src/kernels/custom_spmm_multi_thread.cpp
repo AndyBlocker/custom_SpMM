@@ -1,6 +1,6 @@
 // optimized: acc_tile init moved outside kb loop, memcpy copy, reuse acc_tile per (cb,rb)
-#include "MKL_Sparse_Methods.h"
-#include "csr_builder.h"
+#include "../include/MKL_Sparse_Methods.h"
+#include "../include/csr_builder.h"
 #include <immintrin.h>
 #include <cstring>
 #include <cstdint>
@@ -11,13 +11,6 @@
 #include <omp.h>
 #include <thread>
 
-constexpr int L1_BYTES = 32 * 1024;
-constexpr int L2_BYTES = 1024 * 1024;
-constexpr int VEC_WIDTH = 8;         // AVX2: 8 floats
-constexpr int VEC_WIDTH3 = 24;         // AVX2: 8 floats
-constexpr int VEC_WIDTH4 = 32;         // AVX2: 8 floats
-constexpr size_t ACC_ALIGN = 64;
-constexpr int PREFETCH_P = 4;
 
 // portable aligned alloc/free
 static inline void* portable_aligned_alloc(size_t alignment, size_t size) {
@@ -44,7 +37,9 @@ static inline void prefetch_read(const void* p) { _mm_prefetch((const char*)p, _
 static inline void prefetch_read(const void* p) { __builtin_prefetch(p, 0, 1); }
 #endif
 
-bool MKL_Sparse_CooXDense_Fast_Gustavson_new_yk(
+// Moved to MKL_Sparse_Methods.cpp as the primary implementation
+// This is the optimized multi-threaded version with thread pool
+bool MKL_Sparse_CooXDense_Fast_Gustavson_new_yk_multi_thread(
     float* denseA,
     float* denseB,
     float* denseC,
@@ -90,7 +85,7 @@ bool MKL_Sparse_CooXDense_Fast_Gustavson_new_yk(
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 1;
     if (num_threads <= 0) num_threads = (int)hw;
-    if (num_threads > rowsA) num_threads = rowsA; // ²»Òª³¬¹ýÐÐÊý
+    if (num_threads > rowsA) num_threads = rowsA; // ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 
     // persistent thread pool (static so it's reused across calls)
     static std::unique_ptr<ThreadPool> pool;

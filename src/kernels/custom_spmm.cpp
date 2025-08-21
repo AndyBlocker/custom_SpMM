@@ -1,6 +1,6 @@
 // custom_spmm_avx2_rowtasks_reuse_scratch.cpp
 // AVX2 implementation optimized for Linux (reuse scratch, no row-locks) and Windows-compatible
-#include "MKL_Sparse_Methods.h"
+#include "../include/MKL_Sparse_Methods.h"
 #include <chrono>
 #include <thread>
 #include <mutex>
